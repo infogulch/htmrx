@@ -1,22 +1,81 @@
-#![allow(incomplete_features)]
-#![feature(adt_const_params)]
+#![feature(never_type)]
 
-#[macro_use]
-extern crate rocket;
+use std::sync::{Arc, Mutex, RwLock};
 
-mod header;
-
-use std::sync::{Mutex, RwLock};
-
-use header::*;
-use html_to_string_macro::html;
-use rocket::{
-    form::{Form, FromFormField},
-    response::content::RawHtml,
+use axum::{
+    async_trait,
+    extract::{FromRequestParts, Path, Query, State},
+    http::{
+        header::{self, HeaderName},
+        request::Parts,
+        StatusCode,
+    },
+    response::{Html, IntoResponse, Response},
+    routing::{delete, get, post},
+    Form, RequestPartsExt, Router, TypedHeader,
 };
+use headers::{Header, HeaderValue};
+use html_to_string_macro::html;
+use serde::{Deserialize, Serialize};
+use tokio::main;
 
-fn page(title: String, body: String) -> String {
-    html! {
+#[derive(Debug)]
+struct HXRequest(bool);
+
+impl Header for HXRequest {
+    fn name() -> &'static HeaderName {
+        static NAME: HeaderName = HeaderName::from_static("hx-request");
+        &NAME
+    }
+
+    fn decode<'i, I>(values: &mut I) -> Result<Self, headers::Error>
+    where
+        I: Iterator<Item = &'i HeaderValue>,
+    {
+        let value = values.next().ok_or_else(headers::Error::invalid)?;
+
+        if value == "false" {
+            Ok(HXRequest(false))
+        } else if value == "true" {
+            Ok(HXRequest(true))
+        } else {
+            Err(headers::Error::invalid())
+        }
+    }
+
+    fn encode<E>(&self, values: &mut E)
+    where
+        E: Extend<HeaderValue>,
+    {
+        let s = if self.0 { "true" } else { "false" };
+
+        let value = HeaderValue::from_static(s);
+
+        values.extend(std::iter::once(value));
+    }
+}
+
+#[derive(PartialEq, Eq, Debug)]
+struct IsHXRequest(bool);
+
+#[async_trait]
+impl<S> FromRequestParts<S> for IsHXRequest
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let hx: Option<TypedHeader<HXRequest>> = parts.extract().await.unwrap();
+        Ok(IsHXRequest(match hx {
+            Some(TypedHeader(HXRequest(true))) => true,
+            _ => false,
+        }))
+    }
+}
+
+fn page(title: String, body: String) -> Response {
+    Html(html! {
         <!DOCTYPE html>
         <html>
         <head>
@@ -33,14 +92,20 @@ fn page(title: String, body: String) -> String {
             { body }
         </body>
         </html>
-    }
+    })
+    .into_response()
 }
 
-fn nav(title: String, content: String) -> String {
-    html! {
+fn nav(title: String, content: String) -> Response {
+    Html(html! {
         <head><title>{ title }</title></head>
         { content }
-    }
+    })
+    .into_response()
+}
+
+fn frag(content: String) -> Response {
+    Html(content).into_response()
 }
 
 #[derive(PartialEq, Eq)]
@@ -83,7 +148,7 @@ fn f_about() -> String {
         { f_tabs(Tabs::About) }
         <br />
         <p>"This site demonstrates HTMX + Rust"</p>
-        <form action="/?increment" method="POST" hx-boost="true" hx-target="#about-count" hx-swap="outerHTML">
+        <form action="./" method="POST" hx-boost="true" hx-target="#about-count" hx-swap="outerHTML">
             <button>"Increment"</button>
         </form>
         <p>"The counter is currently at: " { f_about_count() }</p>
@@ -94,38 +159,51 @@ fn f_about_count() -> String {
     html! { <span id="about-count">{ *COUNTER.lock().unwrap() }</span> }
 }
 
-struct Item {
-    id: u32,
-    done: bool,
-    label: String,
+async fn about_index(hx: IsHXRequest) -> impl IntoResponse {
+    let renderer = if !hx.0 { page } else { nav };
+    renderer("About".into(), f_about())
 }
 
-#[derive(strum::EnumString, PartialEq, Clone, Copy, FromFormField)]
+async fn about_increment(hx: IsHXRequest) -> impl IntoResponse {
+    {
+        *COUNTER.lock().unwrap() += 1;
+    }
+    if !hx.0 {
+        return page("About".into(), f_about());
+    }
+    frag(f_about_count())
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct Todo {
+    id: u32,
+    completed: bool,
+    text: String,
+}
+
+#[derive(strum::EnumString, Deserialize, PartialEq, Clone, Copy, Default)]
 enum Filter {
+    #[default]
     All,
     Active,
     Completed,
 }
 
-static TODO_ITEMS: RwLock<Vec<Item>> = RwLock::new(vec![]);
-static TODO_INC: Mutex<u32> = Mutex::new(0);
-static TODO_FILTER: Mutex<Filter> = Mutex::new(Filter::All);
-
-fn f_todos() -> String {
+fn f_todos(db: &DbData) -> String {
     html! {
         { f_tabs(Tabs::Todos) }
         <section class="todos">
             <header>
                 <h1>"todos"</h1>
                 <form action="/todos" method="POST" hx-boost="true" hx-target="none">
-                { f_todos_toggleall(false) }
+                { f_todos_toggleall(db, false) }
                 { f_todos_input(false) }
                 </form>
             </header>
-            { f_todos_items(false) }
+            { f_todos_items(db, false) }
             <footer>
-                { f_todos_count(false) }
-                { f_todos_filter() }
+                { f_todos_count(db, false) }
+                { f_todos_filter(db) }
             </footer>
             <style>r#"
             .todos input {
@@ -177,77 +255,69 @@ fn f_todos() -> String {
     }
 }
 
-fn f_todos_items(oob: bool) -> String {
+fn f_todos_items(db: &DbData, oob: bool) -> String {
     use Filter::*;
-    let filter = *TODO_FILTER.lock().unwrap();
-    let filter_fn = move |i: &'_ &Item| match filter {
+    let filter = db.filter;
+    let filter_fn = move |i: &'_ &Todo| match filter {
         All => true,
-        Active => !i.done,
-        Completed => i.done,
+        Active => !i.completed,
+        Completed => i.completed,
     };
     html! {
         <form action="/todos;apply" method="POST" hx-boost="true" hx-swap="none">
         <ul id="items-list" { if oob { r#"hx-swap-oob="true""# } else { "" } }>
-            { TODO_ITEMS.read().unwrap().iter().rev().filter(filter_fn).map(f_todos_item).collect::<String>() }
+            { db.todos.iter().rev().filter(filter_fn).map(f_todos_item).collect::<String>() }
         </ul>
         <noscript><button>"Apply"</button></noscript>
         </form>
     }
 }
 
-fn f_todos_item(item: &Item) -> String {
+fn f_todos_item(item: &Todo) -> String {
     let id = item.id;
     html! {
         <li hx-target="this" hx-swap="outerHTML">
-            <input type="checkbox" { if item.done { "checked" } else { "" }} hx-post={ format!("/todos/{id}?toggle") }/>
-            <label>{ item.label.as_str() }</label>
-            <button class="delete" hx-delete={ format!("/todos/{id}") }></button>
+            <input type="checkbox" { if item.completed { "checked" } else { "" }} hx-post={ format!("/todos/todo/{id}/toggle") }/>
+            <label>{ item.text.as_str() }</label>
+            <button class="delete" hx-delete={ format!("/todos/todo/{id}") }></button>
         </li>
     }
 }
 
-fn f_todos_toggleall(oob: bool) -> String {
-    let alldone = {
-        let items = TODO_ITEMS.read().unwrap();
-        items.len() > 0 && items.iter().all(|i| i.done)
-    };
+fn f_todos_toggleall(db: &DbData, oob: bool) -> String {
+    let alldone = { db.todos.len() > 0 && db.todos.iter().all(|i| i.completed) };
 
     html! {
         <input id="toggle-all" type="checkbox" { if alldone { "checked" } else { "" } }
-            hx-post="/todos?toggleall" hx-target="this" { if oob { r#"hx-swap-oob="true""# } else { "" } } />
+            hx-post="/todos/toggleall" hx-target="this" { if oob { r#"hx-swap-oob="true""# } else { "" } } />
     }
 }
 
 fn f_todos_input(oob: bool) -> String {
     html! {
-        <input id="todo-new" name="todo-new" placeholder="What needs to be done?" autofocus
+        <input id="todo-new" name="text" placeholder="What needs to be done?" autofocus
         hx-post="/todos" hx-target=".todos ul" hx-swap="afterbegin" { if oob { r#"hx-swap-oob="true""# } else { "" } } />
     }
 }
 
-fn f_todos_count(oob: bool) -> String {
-    let len = TODO_ITEMS
-        .read()
-        .unwrap()
-        .iter()
-        .filter(|i| !i.done)
-        .count();
+fn f_todos_count(db: &DbData, oob: bool) -> String {
+    let len = db.todos.iter().filter(|i| !i.completed).count();
     html! {
         <span id="todo-count" { if oob { r#"hx-swap-oob="true""# } else { "" } }><strong>{ len }</strong>" item" { if len == 1 { "" } else { "s" } } " left"</span>
     }
 }
 
-fn f_todos_filter() -> String {
+fn f_todos_filter(db: &DbData) -> String {
     use Filter::*;
-    let selected_filter = *(TODO_FILTER.lock().unwrap());
+    let selected_filter = db.filter;
     html! {
     <fieldset class="filter" hx-swap="none">
         <legend>"Filter"</legend>
-        <input type="radio" id="filter-all" name="filter" value="All" { if selected_filter == All {"checked"} else {""} }  hx-get="./todos?filter=all" />
+        <input type="radio" id="filter-all" name="mode" value="All" { if selected_filter == All {"checked"} else {""} } hx-get="/todos/filter" />
         <label for="filter-all">"All"</label>
-        <input type="radio" id="filter-active" name="filter" value="Active" { if selected_filter == Active {"checked"} else {""} } hx-get="./todos?filter=active" />
+        <input type="radio" id="filter-active" name="mode" value="Active" { if selected_filter == Active {"checked"} else {""} } hx-get="/todos/filter" />
         <label for="filter-active">"Active"</label>
-        <input type="radio" id="filter-completed" name="filter" value="Completed" { if selected_filter == Completed {"checked"} else {""} } hx-get="./todos?filter=completed" />
+        <input type="radio" id="filter-completed" name="mode" value="Completed" { if selected_filter == Completed {"checked"} else {""} } hx-get="/todos/filter" />
         <label for="filter-completed">"Completed"</label>
     </fieldset>
     <style>r#"
@@ -280,158 +350,188 @@ fn f_todos_filter() -> String {
     }
 }
 
-#[get("/")]
-fn about(hx: Option<HXRequest>) -> RawHtml<String> {
-    let renderer = match hx {
-        None => page,
-        Some(_) => nav,
-    };
-    RawHtml(renderer("About".into(), f_about()))
+async fn todos_index(hx: IsHXRequest, State(state): State<Db>) -> impl IntoResponse {
+    let handler = if !hx.0 { page } else { nav };
+    handler("Todos".into(), f_todos(&state.read().unwrap()))
 }
 
-#[post("/?increment")]
-fn about_increment(hx: Option<HXRequest>) -> RawHtml<String> {
-    {
-        *COUNTER.lock().unwrap() += 1;
+#[derive(Deserialize)]
+struct CreateTodo {
+    text: String,
+}
+
+async fn todos_create(
+    hx: IsHXRequest,
+    State(state): State<Db>,
+    Form(todo): Form<CreateTodo>,
+) -> impl IntoResponse {
+    state.write().unwrap().create(todo.text);
+    if !hx.0 {
+        return todos_index(hx, State(state)).await.into_response();
     }
-    match hx {
-        None => about(None),
-        Some(_) => RawHtml(f_about_count()),
+    let db = state.read().unwrap();
+    frag(html! {
+        { f_todos_item(db.todos.last().unwrap()) }
+        { f_todos_input(true) }
+        { f_todos_count(&db, true) }
+        { f_todos_toggleall(&db, true) }
+    })
+}
+
+async fn todos_toggleall(hx: IsHXRequest, State(state): State<Db>) -> impl IntoResponse {
+    state.write().unwrap().toggleall();
+    if !hx.0 {
+        return todos_index(hx, State(state)).await.into_response();
     }
+    let db = state.read().unwrap();
+    frag(html! {
+        { f_todos_count(&db, true) }
+        { f_todos_toggleall(&db, true) }
+        { f_todos_items(&db, true) }
+    })
 }
 
-#[get("/todos")]
-fn todos(hx: Option<HXRequest>) -> RawHtml<String> {
-    let handler = match hx {
-        None => page,
-        Some(_) => nav,
-    };
-    RawHtml(handler("Todos".into(), f_todos()))
+#[derive(Deserialize)]
+struct TodosFilter {
+    mode: Filter,
 }
 
-#[derive(FromForm)]
-struct NewTodo<'r> {
-    #[field(name = "todo-new")]
-    todo_new: &'r str,
-}
-
-#[post("/todos", data = "<item>")]
-fn todos_add(item: Form<NewTodo>, hx: Option<HXRequest>) -> RawHtml<String> {
-    let id = {
-        let mut inc = TODO_INC.lock().unwrap();
-        *inc = inc.wrapping_add(1);
-        *inc
-    };
-    TODO_ITEMS.write().unwrap().push(Item {
-        id: id,
-        done: false,
-        label: item.todo_new.to_string(),
-    });
-    match hx {
-        None => todos(None),
-        Some(_) => RawHtml(html! {
-            { f_todos_item(TODO_ITEMS.read().unwrap().last().unwrap()) }
-            { f_todos_input(true) }
-            { f_todos_count(true) }
-            { f_todos_toggleall(true) }
-        }),
+async fn todos_filter(
+    hx: IsHXRequest,
+    State(state): State<Db>,
+    Query(TodosFilter { mode }): Query<TodosFilter>,
+) -> impl IntoResponse {
+    state.write().unwrap().filter = mode;
+    if !hx.0 {
+        return todos_index(hx, State(state)).await.into_response();
     }
+    let db = state.read().unwrap();
+    frag(f_todos_items(&db, true))
 }
 
-#[delete("/todos/<id>")]
-fn todos_del(id: u32, hx: Option<HXRequest>) -> RawHtml<String> {
-    {
-        let mut items = TODO_ITEMS.write().unwrap();
-        if let Some(index) = items.iter().position(|i| i.id == id) {
-            items.remove(index);
+async fn todos_toggle(
+    hx: IsHXRequest,
+    Path(id): Path<u32>,
+    State(state): State<Db>,
+) -> impl IntoResponse {
+    let idx = match state.write().unwrap().toggle(id) {
+        Ok(x) => x,
+        _ => return (StatusCode::BAD_REQUEST).into_response(),
+    };
+    if !hx.0 {
+        return todos_index(hx, State(state)).await.into_response();
+    }
+    let db = state.read().unwrap();
+    frag(html! {
+        { if db.filter == Filter::All {
+            f_todos_item(&db.todos[idx])
+        } else { "".to_string() } }
+        { f_todos_count(&db, true) }
+        { f_todos_toggleall(&db, true) }
+    })
+}
+
+async fn todos_delete(
+    hx: IsHXRequest,
+    Path(id): Path<u32>,
+    State(state): State<Db>,
+) -> impl IntoResponse {
+    if let Err(()) = state.write().unwrap().delete(id) {
+        return (StatusCode::BAD_REQUEST).into_response();
+    }
+    if !hx.0 {
+        return todos_index(hx, State(state)).await.into_response();
+    }
+    let db = state.read().unwrap();
+    frag(html! {
+        { f_todos_count(&db, true) }
+        { f_todos_toggleall(&db, true) }
+    })
+}
+
+#[main]
+async fn main() {
+    const TODOS_PATH: &'static str = "/todos";
+
+    let db: Db = Arc::new(RwLock::new(DbData {
+        mount_path: TODOS_PATH,
+        ..Default::default()
+    }));
+
+    let todos_app = Router::new()
+        .route("/", get(todos_index).post(todos_create))
+        .route("/filter", get(todos_filter))
+        .route("/toggleall", post(todos_toggleall))
+        .route("/todo/:id", delete(todos_delete))
+        .route("/todo/:id/toggle", post(todos_toggle))
+        .with_state(db);
+
+    // Compose the routes
+    let app = Router::new()
+        .nest(TODOS_PATH, todos_app)
+        .route("/", get(about_index).post(about_increment));
+
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+
+    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], 8000));
+    axum::Server::bind(&addr)
+        .serve(app.into_make_service())
+        .await
+        .unwrap();
+}
+
+#[derive(Default)]
+struct DbData {
+    mount_path: &'static str,
+    inc: u32,
+    filter: Filter,
+    todos: Vec<Todo>,
+}
+
+impl DbData {
+    fn create(&mut self, text: String) {
+        self.inc += 1;
+        self.todos.push(Todo {
+            id: self.inc,
+            completed: false,
+            text: text,
+        });
+    }
+
+    fn delete(&mut self, id: u32) -> Result<(), ()> {
+        if let Some(index) = self.todos.iter().position(|i| i.id == id) {
+            self.todos.remove(index);
+            Ok(())
         } else {
-            return RawHtml("Error".to_string());
+            Err(())
         }
     }
-    match hx {
-        None => todos(None),
-        Some(_) => RawHtml(html! {
-            { f_todos_count(true) }
-            { f_todos_toggleall(true) }
-        }),
-    }
-}
 
-#[post("/todos/<id>?toggle")]
-fn todos_toggle(id: u32, hx: Option<HXRequest>) -> RawHtml<String> {
-    let idx = {
-        match TODO_ITEMS
-            .write()
-            .unwrap()
+    fn toggle(&mut self, id: u32) -> Result<usize, ()> {
+        match self
+            .todos
             .iter_mut()
             .enumerate()
             .filter(|(_, i)| i.id == id)
             .next()
         {
             Some((idx, item)) => {
-                item.done = !item.done;
-                idx
+                item.completed = !item.completed;
+                Ok(idx)
             }
-            _ => return RawHtml(html! { <p>"Invalid item number"</p> }),
+            None => Err(()),
         }
-    };
-    match hx {
-        None => todos(None),
-        Some(_) => {
-            let filter = *(TODO_FILTER.lock().unwrap());
-            RawHtml(html! {
-                { if filter == Filter::All {
-                    f_todos_item(&TODO_ITEMS.read().unwrap()[idx])
-                } else { "".to_string() } }
-                { f_todos_count(true) }
-                { f_todos_toggleall(true) }
-            })
+    }
+
+    fn toggleall(&mut self) {
+        let set = !self.todos.iter().all(|i| i.completed);
+        for mut item in self.todos.iter_mut() {
+            item.completed = set;
         }
     }
 }
 
-#[post("/todos?toggleall")]
-fn todos_toggleall() -> RawHtml<String> {
-    let set = !TODO_ITEMS.read().unwrap().iter().all(|i| i.done);
-    let mut dirty = false;
-    for mut item in TODO_ITEMS.write().unwrap().iter_mut() {
-        dirty = dirty || item.done != set;
-        item.done = set;
-    }
-    RawHtml(html! {
-        { f_todos_count(true) }
-        { f_todos_toggleall(true) }
-        { if dirty { f_todos_items(true) } else { "".to_string() } }
-    })
-}
-
-#[get("/todos?<filter>")]
-fn todos_filter(filter: Filter, hx: Option<HXRequest>) -> RawHtml<String> {
-    *(TODO_FILTER.lock().unwrap()) = filter;
-    match hx {
-        None => todos(None),
-        Some(_) => RawHtml(f_todos_items(true)),
-    }
-}
-
-#[launch]
-fn rocket() -> _ {
-    rocket::build()
-        .configure(&rocket::Config {
-            address: std::net::Ipv4Addr::new(0, 0, 0, 0).into(),
-            ..rocket::Config::debug_default()
-        })
-        .mount(
-            "/",
-            routes![
-                about,
-                about_increment,
-                todos,
-                todos_add,
-                todos_del,
-                todos_toggle,
-                todos_toggleall,
-                todos_filter,
-            ],
-        )
-}
+type Db = Arc<RwLock<DbData>>;
